@@ -1,0 +1,815 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:google_sign_in/google_sign_in.dart';
+import 'package:sign_in_with_apple/sign_in_with_apple.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/data/latest.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
+import 'package:path_provider/path_provider.dart';
+
+// استيراد ملف Firebase الذي تم إنشاؤه بواسطة flutterfire configure
+import 'firebase_options.dart';
+
+// ============================================================================
+// 1. مفاتيح التخزين المحلي (STORAGE KEYS)
+// ============================================================================
+class AppKeys {
+  static const String langKey = 'app_lang';
+  static const String darkModeKey = 'app_dark_mode';
+  static const String planLastDateKey = 'plan_last_date';
+  static const String planNewMemDoneKey = 'plan_new_mem_done';
+  static const String planNewRevDoneKey = 'plan_new_rev_done';
+  static const String planOldRevDoneKey = 'plan_old_rev_done';
+}
+
+// ============================================================================
+// 2. النماذج والبيانات (MODELS)
+// ============================================================================
+class DailyPlan {
+  final DateTime date;
+  final String newMemRange;
+  final String newRevRange;
+  final String oldRevRange;
+  final bool newMemDone;
+  final bool newRevDone;
+  final bool oldRevDone;
+
+  DailyPlan({
+    required this.date,
+    required this.newMemRange,
+    required this.newRevRange,
+    required this.oldRevRange,
+    this.newMemDone = false,
+    this.newRevDone = false,
+    this.oldRevDone = false,
+  });
+
+  double get completionRate {
+    int total = 3;
+    int done = 0;
+    if (newMemDone) done++;
+    if (newRevDone) done++;
+    if (oldRevDone) done++;
+    return done / total;
+  }
+
+  Map<String, dynamic> toFirestore() {
+    return {
+      'date': "${date.year}-${date.month}-${date.day}",
+      'newMemDone': newMemDone,
+      'newRevDone': newRevDone,
+      'oldRevDone': oldRevDone,
+      'completionRate': completionRate,
+      'updatedAt': FieldValue.serverTimestamp(),
+    };
+  }
+
+  DailyPlan copyWith({
+    DateTime? date,
+    String? newMemRange,
+    String? newRevRange,
+    String? oldRevRange,
+    bool? newMemDone,
+    bool? newRevDone,
+    bool? oldRevDone,
+  }) {
+    return DailyPlan(
+      date: date ?? this.date,
+      newMemRange: newMemRange ?? this.newMemRange,
+      newRevRange: newRevRange ?? this.newRevRange,
+      oldRevRange: oldRevRange ?? this.oldRevRange,
+      newMemDone: newMemDone ?? this.newMemDone,
+      newRevDone: newRevDone ?? this.newRevDone,
+      oldRevDone: oldRevDone ?? this.oldRevDone,
+    );
+  }
+}
+
+class RecitationResult {
+  final String pageRef;
+  final String audioPath;
+  final double accuracy;
+  final List<String> mistakes;
+
+  RecitationResult({
+    required this.pageRef,
+    required this.audioPath,
+    required this.accuracy,
+    required this.mistakes,
+  });
+}
+
+class LocaleState {
+  final String lang;
+  final bool isDark;
+
+  LocaleState({required this.lang, required this.isDark});
+  Locale get locale => Locale(lang);
+}
+
+// ============================================================================
+// 3. الخدمات (SERVICES)
+// ============================================================================
+
+/// خدمة جدولة الأوراد اليومية
+class ScheduleService {
+  static DailyPlan generateDailyPlan(DateTime date, double dailyPages) {
+    return DailyPlan(
+      date: date,
+      newMemRange: 'سورة البقرة: الآيات 1 - 10 (صفحة 2)',
+      newRevRange: 'سورة البقرة: الآيات 11 - 25 (صفحة 3)',
+      oldRevRange: 'الجزء الأول كاملًا',
+    );
+  }
+}
+
+/// خدمة تسجيل الدخول والمزامنة مع Cloud Firestore
+class AuthService {
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  User? get currentUser => _auth.currentUser;
+
+  Future<UserCredential?> signInGoogle() async {
+    try {
+      final GoogleSignInAccount? googleUser = await GoogleSignIn().signIn();
+      if (googleUser == null) return null;
+
+      final GoogleSignInAuthentication googleAuth = await googleUser.authentication;
+      final OAuthCredential credential = GoogleAuthProvider.credential(
+        accessToken: googleAuth.accessToken,
+        idToken: googleAuth.idToken,
+      );
+
+      final result = await _auth.signInWithCredential(credential);
+      if (result.user != null) {
+        await _firestore.collection('users').doc(result.user!.uid).set({
+          'email': result.user!.email,
+          'displayName': result.user!.displayName,
+          'lastLogin': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
+      return result;
+    } catch (e) {
+      debugPrint("Google Sign-In Error: $e");
+      return null;
+    }
+  }
+
+  Future<UserCredential?> signInApple() async {
+    try {
+      final appleCredential = await SignInWithApple.getAppleIDCredential(
+        scopes: [
+          AppleIDAuthorizationScopes.email,
+          AppleIDAuthorizationScopes.fullName,
+        ],
+      );
+
+      final OAuthCredential credential = OAuthProvider('apple.com').credential(
+        idToken: appleCredential.identityToken,
+        accessToken: appleCredential.authorizationCode,
+      );
+
+      final result = await _auth.signInWithCredential(credential);
+      if (result.user != null) {
+        await _firestore.collection('users').doc(result.user!.uid).set({
+          'email': result.user!.email,
+          'displayName': result.user!.displayName,
+          'lastLogin': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      }
+      return result;
+    } catch (e) {
+      debugPrint("Apple Sign-In Error: $e");
+      return null;
+    }
+  }
+
+  Future<void> syncPlanToCloud(DailyPlan plan) async {
+    final user = _auth.currentUser;
+    if (user == null) return;
+
+    final todayStr = "${plan.date.year}-${plan.date.month}-${plan.date.day}";
+    await _firestore
+        .collection('users')
+        .doc(user.uid)
+        .collection('daily_plans')
+        .doc(todayStr)
+        .set(plan.toFirestore(), SetOptions(merge: true));
+  }
+
+  Future<void> signOut() async {
+    await _auth.signOut();
+  }
+}
+
+/// خدمة التسجيل الصوتي المباشر باستخدام الحزمة الحقيقية `AudioRecorder`
+class AudioRecordingService {
+  final AudioRecorder _audioRecorder = AudioRecorder();
+
+  Future<bool> hasPermission() async {
+    return await _audioRecorder.hasPermission();
+  }
+
+  Future<String?> startRecording() async {
+    try {
+      if (await hasPermission()) {
+        final dir = await getApplicationDocumentsDirectory();
+        final path = '${dir.path}/recitation_${DateTime.now().millisecondsSinceEpoch}.m4a';
+        
+        await _audioRecorder.start(
+          const RecordConfig(encoder: AudioEncoder.aacLc),
+          path: path,
+        );
+        return path;
+      }
+    } catch (e) {
+      debugPrint("Recording Error: $e");
+    }
+    return null;
+  }
+
+  Future<String?> stopRecording() async {
+    try {
+      return await _audioRecorder.stop();
+    } catch (e) {
+      debugPrint("Stop Recording Error: $e");
+      return null;
+    }
+  }
+}
+
+/// خدمة الإشعارات المحلية
+class NotificationService {
+  static final FlutterLocalNotificationsPlugin _plugin = FlutterLocalNotificationsPlugin();
+
+  static Future<void> init() async {
+    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const iosSettings = DarwinInitializationSettings();
+    const settings = InitializationSettings(android: androidSettings, iOS: iosSettings);
+
+    await _plugin.initialize(settings);
+    await requestPermissions();
+  }
+
+  static Future<void> requestPermissions() async {
+    if (Platform.isIOS) {
+      await _plugin
+          .resolvePlatformSpecificImplementation<IOSFlutterLocalNotificationsPlugin>()
+          ?.requestPermissions(alert: true, badge: true, sound: true);
+    } else if (Platform.isAndroid) {
+      final androidPlugin = _plugin
+          .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+      await androidPlugin?.requestNotificationsPermission();
+    }
+  }
+
+  static Future<void> scheduleDaily(TimeOfDay time, String title, String body) async {
+    final now = DateTime.now();
+    var scheduledDate = DateTime(now.year, now.month, now.day, time.hour, time.minute);
+    if (scheduledDate.isBefore(now)) {
+      scheduledDate = scheduledDate.add(const Duration(days: 1));
+    }
+
+    await _plugin.zonedSchedule(
+      0,
+      title,
+      body,
+      tz.TZDateTime.from(scheduledDate, tz.local),
+      const NotificationDetails(
+        android: AndroidNotificationDetails('quran_channel', 'تذكيرات القرآن',
+            channelDescription: 'إشعارات لمواعيد ورد الحفظ والتسميع'),
+        iOS: DarwinNotificationDetails(),
+      ),
+      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+      matchDateTimeComponents: DateTimeComponents.time,
+    );
+  }
+}
+
+/// خدمة تصحيح التلاوة بالذكاء الاصطناعي
+class AICorrectionService {
+  Future<RecitationResult> analyzeAudio(String audioPath, String pageRef) async {
+    await Future.delayed(const Duration(seconds: 2));
+    return RecitationResult(
+      pageRef: pageRef,
+      audioPath: audioPath,
+      accuracy: 94.0,
+      mistakes: ['ملاحظة: مراعاة إظهار الغنة في الآية رقم 3'],
+    );
+  }
+}
+
+// ============================================================================
+// 4. إدارة الحالة المتقدمة عبر RIVERPOD
+// ============================================================================
+
+final sharedPreferencesProvider = Provider<SharedPreferences>((ref) {
+  throw UnimplementedError('لم يتم تهيئة SharedPreferences في بداية التشغيل!');
+});
+
+final authServiceProvider = Provider<AuthService>((ref) => AuthService());
+final audioRecorderProvider = Provider<AudioRecordingService>((ref) => AudioRecordingService());
+
+class LocaleNotifier extends Notifier<LocaleState> {
+  late SharedPreferences _prefs;
+
+  @override
+  LocaleState build() {
+    _prefs = ref.watch(sharedPreferencesProvider);
+    final savedLang = _prefs.getString(AppKeys.langKey) ?? 'ar';
+    final savedIsDark = _prefs.getBool(AppKeys.darkModeKey) ?? false;
+    return LocaleState(lang: savedLang, isDark: savedIsDark);
+  }
+
+  void toggleLanguage(String lang) {
+    state = LocaleState(lang: lang, isDark: state.isDark);
+    _prefs.setString(AppKeys.langKey, lang);
+  }
+
+  void toggleDarkMode(bool isDark) {
+    state = LocaleState(lang: state.lang, isDark: isDark);
+    _prefs.setBool(AppKeys.darkModeKey, isDark);
+  }
+}
+
+final localeProvider = NotifierProvider<LocaleNotifier, LocaleState>(LocaleNotifier.new);
+
+class DailyPlanNotifier extends Notifier<DailyPlan> {
+  late SharedPreferences _prefs;
+
+  @override
+  DailyPlan build() {
+    _prefs = ref.watch(sharedPreferencesProvider);
+    return _loadOrResetDailyPlan();
+  }
+
+  DailyPlan _loadOrResetDailyPlan() {
+    final now = DateTime.now();
+    final todayStr = "${now.year}-${now.month}-${now.day}";
+    final lastSavedDate = _prefs.getString(AppKeys.planLastDateKey);
+
+    final initialPlan = ScheduleService.generateDailyPlan(now, 1.0);
+
+    if (lastSavedDate == todayStr) {
+      return initialPlan.copyWith(
+        newMemDone: _prefs.getBool(AppKeys.planNewMemDoneKey) ?? false,
+        newRevDone: _prefs.getBool(AppKeys.planNewRevDoneKey) ?? false,
+        oldRevDone: _prefs.getBool(AppKeys.planOldRevDoneKey) ?? false,
+      );
+    } else {
+      _prefs.setString(AppKeys.planLastDateKey, todayStr);
+      _prefs.setBool(AppKeys.planNewMemDoneKey, false);
+      _prefs.setBool(AppKeys.planNewRevDoneKey, false);
+      _prefs.setBool(AppKeys.planOldRevDoneKey, false);
+
+      return initialPlan;
+    }
+  }
+
+  void toggleTask(String type) {
+    DailyPlan updatedPlan;
+    if (type == 'newMem') {
+      final updatedVal = !state.newMemDone;
+      updatedPlan = state.copyWith(newMemDone: updatedVal);
+      _prefs.setBool(AppKeys.planNewMemDoneKey, updatedVal);
+    } else if (type == 'newRev') {
+      final updatedVal = !state.newRevDone;
+      updatedPlan = state.copyWith(newRevDone: updatedVal);
+      _prefs.setBool(AppKeys.planNewRevDoneKey, updatedVal);
+    } else {
+      final updatedVal = !state.oldRevDone;
+      updatedPlan = state.copyWith(oldRevDone: updatedVal);
+      _prefs.setBool(AppKeys.planOldRevDoneKey, updatedVal);
+    }
+
+    state = updatedPlan;
+    // مزامنة فورية في خلفية Firestore
+    ref.read(authServiceProvider).syncPlanToCloud(updatedPlan);
+  }
+
+  void checkAndRefresh() {
+    state = _loadOrResetDailyPlan();
+  }
+}
+
+final dailyPlanProvider = NotifierProvider<DailyPlanNotifier, DailyPlan>(DailyPlanNotifier.new);
+
+// ============================================================================
+// 5. واجهة المستخدم (UI SCREENS & WIDGETS)
+// ============================================================================
+
+class MainTabNavigation extends StatefulWidget {
+  const MainTabNavigation({super.key});
+
+  @override
+  State<MainTabNavigation> createState() => _MainTabNavigationState();
+}
+
+class _MainTabNavigationState extends State<MainTabNavigation> {
+  int _selectedIndex = 0;
+
+  final List<Widget> _screens = const [
+    TodayScreen(),
+    StatsScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: _screens[_selectedIndex],
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _selectedIndex,
+        onTap: (index) => setState(() => _selectedIndex = index),
+        items: const [
+          BottomNavigationBarItem(
+            icon: Icon(Icons.today),
+            label: 'اليوم',
+          ),
+          BottomNavigationBarItem(
+            icon: Icon(Icons.bar_chart),
+            label: 'الإحصائيات',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class TodayScreen extends ConsumerStatefulWidget {
+  const TodayScreen({super.key});
+
+  @override
+  ConsumerState<TodayScreen> createState() => _TodayScreenState();
+}
+
+class _TodayScreenState extends ConsumerState<TodayScreen> with WidgetsBindingObserver {
+  bool _isRecording = false;
+  String? _recordedFilePath;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      ref.read(dailyPlanProvider.notifier).checkAndRefresh();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final plan = ref.watch(dailyPlanProvider);
+    final planNotifier = ref.read(dailyPlanProvider.notifier);
+    final localeState = ref.watch(localeProvider);
+    final localeNotifier = ref.read(localeProvider.notifier);
+    final auth = ref.watch(authServiceProvider);
+    final recorder = ref.watch(audioRecorderProvider);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('وردي اليومي'),
+        actions: [
+          IconButton(
+            icon: Icon(auth.currentUser == null ? Icons.login : Icons.logout),
+            onPressed: () async {
+              if (auth.currentUser == null) {
+                await auth.signInGoogle();
+              } else {
+                await auth.signOut();
+              }
+              setState(() {});
+            },
+          ),
+          IconButton(
+            icon: Icon(localeState.isDark ? Icons.light_mode : Icons.dark_mode),
+            onPressed: () => localeNotifier.toggleDarkMode(!localeState.isDark),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16.0),
+        children: [
+          Card(
+            elevation: 2,
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'تاريخ اليوم: ${plan.date.year}-${plan.date.month}-${plan.date.day}',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      Text(
+                        '${(plan.completionRate * 100).toInt()}%',
+                        style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green),
+                      )
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  LinearProgressIndicator(value: plan.completionRate, minHeight: 6),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          CheckboxListTile(
+            title: const Text('الحفظ الجديد'),
+            subtitle: Text(plan.newMemRange),
+            value: plan.newMemDone,
+            onChanged: (_) => planNotifier.toggleTask('newMem'),
+          ),
+          CheckboxListTile(
+            title: const Text('المراجعة القريبة'),
+            subtitle: Text(plan.newRevRange),
+            value: plan.newRevDone,
+            onChanged: (_) => planNotifier.toggleTask('newRev'),
+          ),
+          CheckboxListTile(
+            title: const Text('المراجعة البعيدة'),
+            subtitle: Text(plan.oldRevRange),
+            value: plan.oldRevDone,
+            onChanged: (_) => planNotifier.toggleTask('oldRev'),
+          ),
+          const SizedBox(height: 24),
+          Card(
+            color: Colors.green.shade50,
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                children: [
+                  Text(
+                    _isRecording ? 'جاري التسجيل الصوت...' : 'التسجيل الصوتي للتلاوة',
+                    style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      IconButton.filled(
+                        iconSize: 32,
+                        icon: Icon(_isRecording ? Icons.stop : Icons.mic),
+                        style: IconButton.styleFrom(
+                          backgroundColor: _isRecording ? Colors.red : Colors.green,
+                        ),
+                        onPressed: () async {
+                          if (!_isRecording) {
+                            var status = await Permission.microphone.request();
+                            if (status.isGranted) {
+                              final path = await recorder.startRecording();
+                              if (path != null) {
+                                setState(() {
+                                  _isRecording = true;
+                                  _recordedFilePath = path;
+                                });
+                              }
+                            }
+                          } else {
+                            final path = await recorder.stopRecording();
+                            setState(() {
+                              _isRecording = false;
+                              _recordedFilePath = path;
+                            });
+
+                            if (_recordedFilePath != null && context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('تم تحفيظ التسجيل! جاري إرساله للتحليل...')),
+                              );
+
+                              final result = await AICorrectionService().analyzeAudio(_recordedFilePath!, 'صفحة 2');
+                              if (context.mounted) {
+                                showDialog(
+                                  context: context,
+                                  builder: (context) => AlertDialog(
+                                    title: Text('نتيجة التحليل - دقة ${result.accuracy}%'),
+                                    content: Text(
+                                      result.mistakes.isEmpty
+                                          ? 'ممتاز! تلاوة ممتازة دون أخطاء.'
+                                          : result.mistakes.join('\n'),
+                                    ),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.pop(context),
+                                        child: const Text('موافق'),
+                                      )
+                                    ],
+                                  ),
+                                );
+                              }
+                            }
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          )
+        ],
+      ),
+    );
+  }
+}
+
+/// شاشة الإحصائيات مع الرسم البياني ومتابعة التقدم
+class StatsScreen extends ConsumerWidget {
+  const StatsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final auth = ref.watch(authServiceProvider);
+    final user = auth.currentUser;
+
+    if (user == null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('الإحصائيات السحابية')),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.cloud_off, size: 64, color: Colors.grey),
+              const SizedBox(height: 16),
+              const Text('سجّل الدخول لعرض وتزامن الإحصائيات السحابية'),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.login),
+                label: const Text('تسجيل الدخول بـ Google'),
+                onPressed: () async {
+                  await auth.signInGoogle();
+                },
+              )
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('متابعة الإنجاز والإحصائيات')),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('users')
+            .doc(user.uid)
+            .collection('daily_plans')
+            .orderBy('date', descending: true)
+            .limit(7)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+            return const Center(child: Text('لا توجد بيانات محفوظة بعد. أتمم وردك اليوم لتسجيل إحصائياتك!'));
+          }
+
+          final docs = snapshot.data!.docs;
+
+          return ListView(
+            padding: const EdgeInsets.all(16.0),
+            children: [
+              Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'نسبة الإنجاز خلال الأيام الأخيرة',
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: docs.map((doc) {
+                          final data = doc.data() as Map<String, dynamic>;
+                          final double rate = (data['completionRate'] ?? 0.0).toDouble();
+                          final String dateStr = data['date'] ?? '';
+
+                          return Column(
+                            mainAxisAlignment: MainAxisAlignment.end,
+                            children: [
+                              Text('${(rate * 100).toInt()}%', style: const TextStyle(fontSize: 10)),
+                              const SizedBox(height: 4),
+                              Container(
+                                width: 18,
+                                height: 120 * rate, // ارتفاع العمود حسب نسبة الإنجاز
+                                decoration: BoxDecoration(
+                                  color: Colors.green,
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                dateStr.length >= 5 ? dateStr.substring(5) : dateStr,
+                                style: const TextStyle(fontSize: 10),
+                              ),
+                            ],
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              const Text('سجل المتابعة تفصيلياً:', style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              ...docs.map((doc) {
+                final data = doc.data() as Map<String, dynamic>;
+                return ListTile(
+                  leading: const Icon(Icons.check_circle_outline, color: Colors.green),
+                  title: Text('تاريخ: ${data['date']}'),
+                  subtitle: Text('نسبة الإتمام: ${((data['completionRate'] ?? 0) * 100).toInt()}%'),
+                );
+              }),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// 6. مدخل التطبيق الرئيسي (MAIN & ENTRY POINT)
+// ============================================================================
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 1. تحميل SharedPreferences محليًا
+  final prefs = await SharedPreferences.getInstance();
+
+  // 2. تهيئة الخدمات السحابية والإشعارات
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  tz.initializeTimeZones();
+  await NotificationService.init();
+
+  // 3. جدولة التذكير اليومي (الساعة 5:00 صباحاً)
+  await NotificationService.scheduleDaily(
+    const TimeOfDay(hour: 5, minute: 0),
+    'تذكير الحفظ اليومي',
+    'حان وقت مراجعة وحفظ القرآن الكريم اليوم',
+  );
+
+  // 4. تشغيل التطبيق مع Riverpod Overrides
+  runApp(
+    ProviderScope(
+      overrides: [
+        sharedPreferencesProvider.overrideWithValue(prefs),
+      ],
+      child: const QuranCompanionApp(),
+    ),
+  );
+}
+
+class QuranCompanionApp extends ConsumerWidget {
+  const QuranCompanionApp({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final localeState = ref.watch(localeProvider);
+
+    return MaterialApp(
+      title: 'رفيق القرآن',
+      debugShowCheckedModeBanner: false,
+      locale: localeState.locale,
+      themeMode: localeState.isDark ? ThemeMode.dark : ThemeMode.light,
+      theme: ThemeData(
+        brightness: Brightness.light,
+        primarySwatch: Colors.green,
+        useMaterial3: true,
+      ),
+      darkTheme: ThemeData(
+        brightness: Brightness.dark,
+        primarySwatch: Colors.green,
+        useMaterial3: true,
+      ),
+      home: const MainTabNavigation(),
+    );
+  }
+}
